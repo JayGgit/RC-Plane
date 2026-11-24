@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <title>RC Plane Controller</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="top-status">
+        <span id="rssiText" class="top-status-item">Signal unavailable</span>
+        <span id="packetLossText" class="top-status-item">Packet loss unavailable</span>
+        <span id="gamepadText" class="top-status-item">Controller unavailable</span>
+      </div>
+
+      <div class="status-group">
+        <div id="statusBadge" class="status" role="status" aria-live="polite">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="readout">
+        <div class="readout-heading">
+          <span id="throttleState">Stable</span>
+        </div>
+
+        <div class="percentage" aria-live="polite">
+          <span id="pct">0</span><span>%</span>
+        </div>
+
+        <div class="microseconds">
+          <span id="us">1000</span>
+          <span>microseconds</span>
+        </div>
+
+        <div class="battery-estimate" title="Estimated from throttle only; actual current and voltage are not measured">
+          <div>
+            <span class="battery-label">Battery estimate · 11.1 V 3S</span>
+            <strong id="batteryRemaining">2.20 Ah remaining</strong>
+          </div>
+          <div>
+            <span id="batteryRuntime">~4.4 min at 30 A</span>
+            <button id="resetBatteryBtn" type="button" onclick="resetBatteryEstimate()">Reset</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="slider-section">
+        <label for="slider">Target throttle</label>
+        <input
+          type="range"
+          id="slider"
+          min="1000"
+          max="2000"
+          value="1000"
+          step="5"
+          disabled
+        >
+        <div class="slider-values" aria-hidden="true">
+          <span>1000</span>
+          <span>1500</span>
+          <span>2000</span>
+        </div>
+      </div>
+
+      <div class="action-grid">
+        <button id="connectBtn" class="button button-primary" type="button" onclick="toggleConnect()">
+          Connect
+        </button>
+
+        <button id="armBtn" class="button" type="button" onclick="toggleArm()" disabled>
+          Arm
+        </button>
+
+        <button id="calibrateBtn" class="button" type="button" onclick="calibrateESC()" disabled>
+          Calibrate ESC
+        </button>
+
+        <button id="stopBtn" class="button button-danger" type="button" onclick="emergencyStop()" disabled>
+          Emergency stop <kbd>Space</kbd>
+        </button>
+      </div>
+
+      <section class="sensor-card" aria-labelledby="sensorCardTitle">
+        <div class="sensor-card-heading">
+          <div>
+            <p class="section-label">ADXL345</p>
+            <h2 id="sensorCardTitle">Acceleration</h2>
+          </div>
+          <span id="sensorStatus" class="sensor-status">Unavailable</span>
+        </div>
+
+        <div class="sensor-grid">
+          <div class="sensor-stat">
+            <span>X axis</span>
+            <strong id="accelX">-- g</strong>
+          </div>
+          <div class="sensor-stat">
+            <span>Y axis</span>
+            <strong id="accelY">-- g</strong>
+          </div>
+          <div class="sensor-stat">
+            <span>Z axis</span>
+            <strong id="accelZ">-- g</strong>
+          </div>
+          <div class="sensor-stat">
+            <span>Magnitude</span>
+            <strong id="accelMagnitude">-- g</strong>
+          </div>
+        </div>
+      </section>
+    </section>
+
+  </main>
+
+  <dialog id="appDialog" class="dialog" aria-labelledby="dialogTitle" aria-describedby="dialogDescription">
+    <form method="dialog" id="dialogForm">
+      <div class="dialog-header">
+        <p class="section-label" id="dialogLabel">Confirmation</p>
+        <h2 id="dialogTitle">Continue?</h2>
+      </div>
+
+      <div class="dialog-body">
+        <p id="dialogDescription"></p>
+      </div>
+
+      <div class="dialog-actions">
+        <button id="dialogCancel" class="button" value="cancel" type="submit">Cancel</button>
+        <button id="dialogConfirm" class="button button-primary" value="confirm" type="submit">Continue</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    let socket = null;
+    let connected = false;
+    let armed = false;
+    let reconnectTimer = null;
+    let rampTimer = null;
+    let heartbeatTimer = null;
+    let commandedPulse = 1000;
+    let disarming = false;
+    let calibrating = false;
+    let rampTargetPulse = 1000;
+    let motionState = 'Stable';
+    let arrowHoldTimer = null;
+    let arrowDirection = 0;
+    let arrowHoldStartedAt = 0;
+    let gamepadPollTimer = null;
+    const RAMP_STEP_US = 5;
+    const RAMP_INTERVAL_MS = 10;
+    const HEARTBEAT_INTERVAL_MS = 900;
+    const BATTERY_VOLTAGE_V = 11.1;
+    const BATTERY_CAPACITY_MAH = 2200;
+    const BATTERY_USABLE_FRACTION = 0.80;
+    const BATTERY_MAX_CURRENT_A = 30;
+    const storedConsumedBatteryMah = Number(localStorage.getItem('rc-plane-consumed-mah') || 0);
+    let consumedBatteryMah =
+      Number.isFinite(storedConsumedBatteryMah) && storedConsumedBatteryMah >= 0
+        ? storedConsumedBatteryMah
+        : 0;
+    let batteryTickTime = performance.now();
+    let packetsSent = 0;
+    let packetsLost = 0;
+
+    const statusBadge = document.getElementById('statusBadge');
+    const statusText = document.getElementById('statusText');
+    const rssiText = document.getElementById('rssiText');
+    const packetLossText = document.getElementById('packetLossText');
+    const gamepadText = document.getElementById('gamepadText');
+    const connectBtn = document.getElementById('connectBtn');
+    const armBtn = document.getElementById('armBtn');
+    const slider = document.getElementById('slider');
+    const pctEl = document.getElementById('pct');
+    const usEl = document.getElementById('us');
+    const throttleState = document.getElementById('throttleState');
+    const batteryRemaining = document.getElementById('batteryRemaining');
+    const batteryRuntime = document.getElementById('batteryRuntime');
+    const sensorStatus = document.getElementById('sensorStatus');
+    const accelX = document.getElementById('accelX');
+    const accelY = document.getElementById('accelY');
+    const accelZ = document.getElementById('accelZ');
+    const accelMagnitude = document.getElementById('accelMagnitude');
+    const appDialog = document.getElementById('appDialog');
+    const dialogForm = document.getElementById('dialogForm');
+    const dialogLabel = document.getElementById('dialogLabel');
+    const dialogTitle = document.getElementById('dialogTitle');
+    const dialogDescription = document.getElementById('dialogDescription');
+    const dialogCancel = document.getElementById('dialogCancel');
+    const dialogConfirm = document.getElementById('dialogConfirm');
+    const controls = [
+      slider,
+      document.getElementById('calibrateBtn'),
+      document.getElementById('stopBtn')
+    ];
+
+    function openDialog({ label = 'Confirmation', title, description, confirmText = 'Continue', cancelText = 'Cancel' }) {
+      return new Promise(resolve => {
+        dialogLabel.textContent = label;
+        dialogTitle.textContent = title;
+        dialogDescription.textContent = description;
+        dialogCancel.textContent = cancelText;
+        dialogConfirm.textContent = confirmText;
+
+        const handleClose = () => {
+          dialogForm.removeEventListener('submit', handleSubmit);
+          resolve(appDialog.returnValue === 'confirm');
+        };
+
+        const handleSubmit = event => {
+          event.preventDefault();
+          appDialog.close(event.submitter?.value === 'confirm' ? 'confirm' : 'cancel');
+        };
+
+        dialogForm.addEventListener('submit', handleSubmit);
+        appDialog.addEventListener('close', handleClose, { once: true });
+        appDialog.returnValue = '';
+        appDialog.showModal();
+        dialogConfirm.focus();
+      });
+    }
+
+    async function askCalibrationStop() {
+      if (calibrating) {
+        calibrating = false;
+        setCalibrationControls(false);
+        sendSocketCommand('CALIBRATE_CANCEL');
+      }
+    }
+
+    function sendSocketCommand(command) {
+      if (socket?.readyState !== WebSocket.OPEN) return false;
+      try {
+        socket.send(command);
+        return true;
+      } catch (error) {
+        console.error('WebSocket command failed:', error.message);
+        return false;
+      }
+    }
+
+    function resetPacketLoss() {
+      packetsSent = 0;
+      packetsLost = 0;
+      packetLossText.textContent = 'Packet loss 0.0%';
+    }
+
+    function updatePacketLoss(lost) {
+      if (lost) packetsLost++;
+      else packetsSent++;
+      const total = packetsSent + packetsLost;
+      const percentage = total === 0 ? 0 : (packetsLost / total) * 100;
+      packetLossText.textContent =
+        `Packet loss ${percentage.toFixed(1)}% (${packetsLost}/${total})`;
+    }
+
+    function updateAcceleration(payload) {
+      const values = {};
+      for (const field of payload.split(',')) {
+        const separator = field.indexOf('=');
+        if (separator === -1) continue;
+        const name = field.slice(0, separator).trim();
+        const rawValue = field.slice(separator + 1).trim();
+        if (name === 'status') {
+          values.status = rawValue;
+        } else {
+          const value = Number(rawValue);
+          if (Number.isFinite(value)) values[name] = value;
+        }
+      }
+
+      if (values.status === 'unavailable') {
+        sensorStatus.textContent = 'Unavailable';
+        sensorStatus.classList.remove('active');
+        accelX.textContent = '-- g';
+        accelY.textContent = '-- g';
+        accelZ.textContent = '-- g';
+        accelMagnitude.textContent = '-- g';
+        return;
+      }
+
+      if (!Number.isFinite(values.x) ||
+          !Number.isFinite(values.y) ||
+          !Number.isFinite(values.z)) {
+        sensorStatus.textContent = 'Invalid';
+        sensorStatus.classList.remove('active');
+        return;
+      }
+
+      const magnitude = Math.sqrt(
+        values.x * values.x +
+        values.y * values.y +
+        values.z * values.z
+      );
+
+      accelX.textContent = `${values.x.toFixed(2)} g`;
+      accelY.textContent = `${values.y.toFixed(2)} g`;
+      accelZ.textContent = `${values.z.toFixed(2)} g`;
+      accelMagnitude.textContent = `${magnitude.toFixed(2)} g`;
+      sensorStatus.textContent = 'Connected';
+      sensorStatus.classList.add('active');
+    }
+
+    function setConnectedUI(isConnected) {
+      connected = isConnected;
+      statusBadge.className = isConnected ? 'status connected' : 'status';
+      statusText.textContent = isConnected ? 'Connected' : 'Disconnected';
+      connectBtn.textContent = isConnected ? 'Disconnect' : 'Connect';
+      connectBtn.disabled = false;
+      connectBtn.removeAttribute('aria-busy');
+      armBtn.disabled = !isConnected;
+      setArmedUI(isConnected ? armed : false);
+
+      if (!isConnected) {
+        stopHeartbeat();
+        stopArrowHold();
+        calibrating = false;
+        sensorStatus.textContent = 'Unavailable';
+        sensorStatus.classList.remove('active');
+        accelX.textContent = '-- g';
+        accelY.textContent = '-- g';
+        accelZ.textContent = '-- g';
+        accelMagnitude.textContent = '-- g';
+        packetLossText.textContent = 'Packet loss unavailable';
+        motionState = 'Stable';
+        throttleState.textContent = motionState;
+        rssiText.textContent = 'Signal unavailable';
+        commandedPulse = 1000;
+        rampTargetPulse = 1000;
+        updateReadout(1000);
+      }
+      setCalibrationControls(calibrating);
+    }
+
+    function setCalibrationControls(isCalibrating) {
+      connectBtn.disabled = isCalibrating;
+      armBtn.disabled = isCalibrating || !connected;
+    }
+
+    function setArmedUI(isArmed) {
+      armed = isArmed;
+      disarming = false;
+      armBtn.textContent = armed ? 'Disarm' : 'Arm';
+      armBtn.classList.toggle('button-danger', armed);
+      armBtn.disabled = !connected;
+      controls.forEach(el => el.disabled = !connected || !armed);
+      setCalibrationControls(calibrating);
+
+      if (!armed) {
+        stopHeartbeat();
+        stopArrowHold();
+        commandedPulse = 1000;
+        rampTargetPulse = 1000;
+        updateReadout(1000);
+      } else {
+        resetPacketLoss();
+        startHeartbeat();
+      }
+    }
+
+    function toggleArm() {
+      if (calibrating || !connected || socket?.readyState !== WebSocket.OPEN) return;
+      if (armed) {
+        if (disarming) return;
+        disarming = true;
+        armBtn.disabled = true;
+        controls.forEach(el => el.disabled = true);
+        rampTargetPulse = 1000;
+        commandedPulse = 1000;
+        slider.value = 1000;
+        updateReadout(1000, false);
+        motionState = 'Decelerating';
+        throttleState.textContent = motionState;
+        sendSocketCommand('1000');
+
+        const waitUntilStopped = () => {
+          if (!armed || !connected) return;
+          if (commandedPulse !== 1000) {
+            setTimeout(waitUntilStopped, 10);
+            return;
+          }
+          sendSocketCommand('DISARM');
+        };
+
+        waitUntilStopped();
+      } else {
+        sendSocketCommand('ARM');
+      }
+    }
+
+    function updateReadout(val, moveSlider = true) {
+      const pulse = Number(val);
+      const pct = Math.round((pulse - 1000) / 10);
+      if (moveSlider) slider.value = pulse;
+      usEl.textContent = pulse;
+      pctEl.textContent = pct;
+      throttleState.textContent = motionState;
+    }
+
+    function toggleConnect() {
+      if (calibrating) return;
+      if (connected) {
+        if (socket?.readyState === WebSocket.OPEN) {
+          connectBtn.disabled = true;
+          connectBtn.textContent = 'Disconnecting';
+          connectBtn.setAttribute('aria-busy', 'true');
+          statusBadge.className = 'status';
+          statusText.textContent = 'Disconnecting';
+
+          rampTargetPulse = 1000;
+          commandedPulse = 1000;
+          slider.value = 1000;
+          updateReadout(1000, false);
+          motionState = 'Decelerating';
+          throttleState.textContent = motionState;
+          sendSocketCommand('1000');
+
+          const waitUntilStopped = () => {
+            if (!connected) return;
+            if (commandedPulse !== 1000) {
+              setTimeout(waitUntilStopped, 10);
+              return;
+            }
+            if (socket?.readyState === WebSocket.OPEN) {
+              sendSocketCommand('STOP');
+              sendSocketCommand('DISCONNECT');
+            }
+          };
+
+          waitUntilStopped();
+        }
+        return;
+      }
+      if (socket?.readyState === WebSocket.OPEN) {
+        connectBtn.disabled = true;
+        connectBtn.textContent = 'Connecting';
+        connectBtn.setAttribute('aria-busy', 'true');
+        statusBadge.className = 'status';
+        statusText.textContent = 'Connecting';
+        sendSocketCommand('CONNECT');
+      }
+    }
+
+    function sendCommand(val) {
+      if (!connected || !armed || disarming || socket?.readyState !== WebSocket.OPEN) return;
+      if (!Number.isInteger(val) || val < 1000 || val > 2000) return;
+      rampTargetPulse = val;
+      commandedPulse = val;
+      motionState = 'Stable';
+      updateReadout(val, false);
+      sendSocketCommand(String(val));
+    }
+
+    function startHeartbeat() {
+      stopHeartbeat();
+      if (!connected || !armed) return;
+      heartbeatTimer = setInterval(() => {
+        if (connected && armed && !calibrating && socket?.readyState === WebSocket.OPEN) {
+          sendSocketCommand(String(commandedPulse));
+        }
+      }, HEARTBEAT_INTERVAL_MS);
+    }
+
+    function stopHeartbeat() {
+      if (rampTimer !== null) {
+        clearInterval(rampTimer);
+        rampTimer = null;
+      }
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
+    function estimateCurrentA() {
+      const throttleFraction = (commandedPulse - 1000) / 1000;
+      return 0.10 + (BATTERY_MAX_CURRENT_A - 0.10) * Math.pow(throttleFraction, 2.2);
+    }
+
+    function updateBatteryEstimate() {
+      if (!Number.isFinite(consumedBatteryMah) || consumedBatteryMah < 0) {
+        consumedBatteryMah = 0;
+      }
+      const now = performance.now();
+      const elapsedHours = Math.max(0, now - batteryTickTime) / 3600000;
+      batteryTickTime = now;
+
+      if (connected && !calibrating) {
+        const currentA = estimateCurrentA();
+        consumedBatteryMah += currentA * elapsedHours * 1000;
+        consumedBatteryMah = Math.max(0, consumedBatteryMah);
+        localStorage.setItem('rc-plane-consumed-mah', String(consumedBatteryMah));
+      }
+
+      const usableCapacityMah = BATTERY_CAPACITY_MAH * BATTERY_USABLE_FRACTION;
+      const usableRemainingMah = Math.max(0, usableCapacityMah - consumedBatteryMah);
+      const totalRemainingMah = Math.max(0, BATTERY_CAPACITY_MAH - consumedBatteryMah);
+      const currentA = estimateCurrentA();
+      const remainingMinutes = currentA > 0
+        ? (usableRemainingMah / 1000) / currentA * 60
+        : Infinity;
+
+      batteryRemaining.textContent =
+        `${(totalRemainingMah / 1000).toFixed(2)} Ah remaining`;
+
+      if (usableRemainingMah <= 0) {
+        batteryRuntime.textContent = 'Reserve reached';
+      } else if (Number.isFinite(remainingMinutes) && remainingMinutes < 600) {
+        batteryRuntime.textContent =
+          `~${remainingMinutes.toFixed(1)} min · ${currentA.toFixed(1)} A est.`;
+      } else {
+        batteryRuntime.textContent =
+          `~${(remainingMinutes / 60).toFixed(1)} hr · ${currentA.toFixed(1)} A est.`;
+      }
+    }
+
+    async function resetBatteryEstimate() {
+      const confirmed = await openDialog({
+        label: 'Battery estimate',
+        title: 'Reset consumed capacity?',
+        description: 'Use this after charging or replacing the battery.',
+        confirmText: 'Reset estimate'
+      });
+      if (!confirmed) return;
+
+      consumedBatteryMah = 0;
+      localStorage.setItem('rc-plane-consumed-mah', '0');
+      batteryTickTime = performance.now();
+      updateBatteryEstimate();
+    }
+
+    slider.addEventListener('input', () => {
+      const val = Number(slider.value);
+      sendCommand(val);
+    });
+
+    function getXboxRightTrigger(gamepad) {
+      if (!gamepad) return null;
+
+      if (gamepad.buttons?.[7]) {
+        return gamepad.buttons[7].value;
+      }
+
+      if (gamepad.axes?.[5] !== undefined) {
+        return Math.max(0, Math.min(1, (gamepad.axes[5] + 1) / 2));
+      }
+
+      return null;
+    }
+
+    function pollGamepad() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const gamepad = Array.from(pads).find(pad =>
+        pad && pad.connected &&
+        (pad.mapping === 'standard' || pad.id.toLowerCase().includes('xbox'))
+      );
+
+      if (!gamepad) {
+        gamepadText.textContent = 'Controller unavailable';
+        return;
+      }
+
+      gamepadText.textContent = `Controller: ${gamepad.id}`;
+      if (!connected || !armed || calibrating) return;
+
+      const trigger = getXboxRightTrigger(gamepad);
+      if (trigger === null) return;
+
+      const triggerValue = trigger < 0.02 ? 0 : trigger;
+      const targetPulse = Math.round(1000 + (triggerValue * 1000));
+      slider.value = targetPulse;
+      sendCommand(targetPulse);
+    }
+
+    window.addEventListener('gamepadconnected', event => {
+      gamepadText.textContent = `Controller: ${event.gamepad.id}`;
+    });
+
+    window.addEventListener('gamepaddisconnected', () => {
+      gamepadText.textContent = 'Controller unavailable';
+      if (connected) {
+        slider.value = 1000;
+        sendCommand(1000);
+      }
+    });
+
+    gamepadPollTimer = setInterval(pollGamepad, 50);
+
+    function stopArrowHold() {
+      if (arrowHoldTimer) {
+        clearInterval(arrowHoldTimer);
+        arrowHoldTimer = null;
+      }
+      arrowDirection = 0;
+    }
+
+    function emergencyStop() {
+      askCalibrationStop();
+      stopArrowHold();
+      commandedPulse = 1000;
+      rampTargetPulse = 1000;
+      motionState = 'Stable';
+      throttleState.textContent = motionState;
+      updateReadout(1000);
+      if (connected && socket?.readyState === WebSocket.OPEN) {
+        sendSocketCommand('STOP');
+      }
+    }
+
+    document.addEventListener('keydown', event => {
+      if (event.code === 'Space' || event.key === ' ') {
+        event.preventDefault();
+        if (!event.repeat) {
+          const stopButton = document.getElementById('stopBtn');
+          stopButton.classList.add('keyboard-pressed');
+          emergencyStop();
+          setTimeout(() => stopButton.classList.remove('keyboard-pressed'), 140);
+        }
+        return;
+      }
+
+      if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && connected && armed) {
+        event.preventDefault();
+        if (arrowHoldTimer) return;
+
+        arrowDirection = event.key === 'ArrowRight' ? 1 : -1;
+        arrowHoldStartedAt = performance.now();
+
+        const updateHeldThrottle = () => {
+          const heldMs = performance.now() - arrowHoldStartedAt;
+          const secondsHeld = heldMs / 1000;
+          const change = Math.max(5, Math.min(500,
+            Math.round(5 + (secondsHeld * secondsHeld * 20))
+          ));
+          const nextTarget = Math.max(1000, Math.min(2000,
+            rampTargetPulse + (arrowDirection * change)
+          ));
+
+          slider.value = nextTarget;
+          sendCommand(nextTarget);
+        };
+
+        updateHeldThrottle();
+        arrowHoldTimer = setInterval(updateHeldThrottle, 50);
+      }
+
+      if (event.key === 'ArrowDown' && connected && armed) {
+        event.preventDefault();
+        if (arrowHoldTimer) {
+          clearInterval(arrowHoldTimer);
+          arrowHoldTimer = null;
+        }
+        arrowDirection = 0;
+        slider.value = 1000;
+        sendCommand(1000);
+      }
+    });
+
+    document.addEventListener('keyup', event => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        if (arrowHoldTimer) {
+          clearInterval(arrowHoldTimer);
+          arrowHoldTimer = null;
+        }
+        arrowDirection = 0;
+      }
+    });
+
+    async function calibrateESC() {
+      if (!connected || socket?.readyState !== WebSocket.OPEN) return;
+
+      const propellerRemoved = await openDialog({
+        label: 'Safety check',
+        title: 'Remove the propeller',
+        description: 'Remove the propeller and keep clear of the motor before continuing.',
+        confirmText: 'Propeller removed'
+      });
+      if (!propellerRemoved) return;
+
+      const batteryDisconnected = await openDialog({
+        label: 'Calibration step 1',
+        title: 'Unplug the battery',
+        description: 'Disconnect the ESC battery before sending maximum throttle.',
+        confirmText: 'Battery unplugged'
+      });
+      if (!batteryDisconnected) return;
+
+      const ready = await openDialog({
+        label: 'Calibration step 2',
+        title: 'Hold maximum throttle',
+        description: 'Maximum throttle is 2000 microseconds. Keep the battery unplugged and continue.',
+        confirmText: 'Send maximum'
+      });
+      if (!ready) return;
+
+      calibrating = true;
+      setCalibrationControls(true);
+      stopHeartbeat();
+      motionState = 'Stable';
+      throttleState.textContent = motionState;
+      commandedPulse = 2000;
+      updateReadout(2000);
+      if (!sendSocketCommand('CALIBRATE_HIGH')) {
+        calibrating = false;
+        setCalibrationControls(false);
+        return;
+      }
+
+      const batteryReady = await openDialog({
+        label: 'Calibration step 3',
+        title: 'Connect the battery',
+        description: 'Connect the ESC battery now. Wait for the ESC to beep twice.',
+        confirmText: 'Beep heard',
+        cancelText: 'Cancel'
+      });
+      if (!batteryReady) {
+        calibrating = false;
+        setCalibrationControls(false);
+        sendSocketCommand('CALIBRATE_CANCEL');
+        return;
+      }
+
+      const lowNow = await openDialog({
+        label: 'Calibration step 4',
+        title: 'Send minimum throttle',
+        description: 'Within two seconds of the beep twice, send 1000 microseconds minimum throttle.',
+        confirmText: 'Send minimum',
+        cancelText: 'Cancel'
+      });
+      if (!lowNow) {
+        calibrating = false;
+        setCalibrationControls(false);
+        sendSocketCommand('CALIBRATE_CANCEL');
+        return;
+      }
+
+      if (!sendSocketCommand('CALIBRATE_LOW')) {
+        calibrating = false;
+        setCalibrationControls(false);
+      }
+    }
+
+    function connectSocket() {
+      clearTimeout(reconnectTimer);
+      const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      socket = new WebSocket(`${socketProtocol}//${location.host}/ws`);
+
+      socket.addEventListener('open', () => {
+        statusBadge.className = 'status';
+        statusText.textContent = 'Ready';
+        controls.forEach(el => el.disabled = true);
+        connectBtn.disabled = false;
+        connectBtn.textContent = 'Connect';
+        connectBtn.removeAttribute('aria-busy');
+        rssiText.textContent = 'Signal unavailable';
+      });
+
+      socket.addEventListener('message', event => {
+        if (event.data === 'CONNECTED') setConnectedUI(true);
+        else if (event.data === 'DISCONNECTED') setConnectedUI(false);
+        else if (event.data === 'ARMED') setArmedUI(true);
+        else if (event.data === 'DISARMED') setArmedUI(false);
+        else if (event.data === 'PACKET_SENT') updatePacketLoss(false);
+        else if (event.data === 'PACKET_LOST') updatePacketLoss(true);
+        else if (event.data.startsWith('ADXL:')) {
+          updateAcceleration(event.data.slice(5));
+        }
+        else if (event.data === 'STOPPED') {
+          motionState = 'Stable';
+          updateReadout(1000);
+        }
+        else if (event.data === 'DISCONNECTING') {
+          setConnectedUI(false);
+          statusBadge.className = 'status';
+          statusText.textContent = 'Disconnecting';
+          connectBtn.disabled = true;
+          connectBtn.textContent = 'Disconnecting';
+          connectBtn.setAttribute('aria-busy', 'true');
+        }
+        else if (event.data.startsWith('RSSI:')) {
+          const value = event.data.slice(5);
+          rssiText.textContent = value === 'UNAVAILABLE' ? 'Signal unavailable' : `Signal ${value} dBm`;
+        }
+        else if (event.data === 'CALIBRATING') {
+          statusText.textContent = 'Maximum throttle';
+        } else if (event.data === 'CALIBRATING_LOW') {
+          statusText.textContent = 'Minimum throttle';
+        } else if (event.data === 'CALIBRATION_COMPLETE') {
+          statusText.textContent = 'Wait for completion beep';
+          calibrating = false;
+          setCalibrationControls(false);
+          commandedPulse = 1000;
+          rampTargetPulse = 1000;
+          updateReadout(1000);
+          startHeartbeat();
+        } else if (event.data === 'CALIBRATION_CANCELLED') {
+          statusText.textContent = 'Calibration cancelled';
+          calibrating = false;
+          setCalibrationControls(false);
+          commandedPulse = 1000;
+          rampTargetPulse = 1000;
+          updateReadout(1000);
+          startHeartbeat();
+        } else if (event.data === 'ERROR') {
+          calibrating = false;
+          setConnectedUI(false);
+          statusBadge.className = 'status error';
+          statusText.textContent = 'Connection failed';
+          connectBtn.disabled = false;
+          connectBtn.textContent = 'Connect';
+          connectBtn.removeAttribute('aria-busy');
+        }
+      });
+
+      socket.addEventListener('close', () => {
+        calibrating = false;
+        setConnectedUI(false);
+        statusBadge.className = 'status error';
+        statusText.textContent = 'Server unavailable';
+        reconnectTimer = setTimeout(connectSocket, 1500);
+      });
+
+      socket.addEventListener('error', () => socket.close());
+    }
+
+    window.addEventListener('beforeunload', () => {
+      if (connected) {
+        sendSocketCommand('1000');
+      }
+    });
+
+    updateBatteryEstimate();
+    setInterval(updateBatteryEstimate, 1000);
+    connectSocket();
+  </script>
+</body>
+</html>
